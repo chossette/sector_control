@@ -6,19 +6,21 @@
 #include <Wire.h>
 
 // I2C setup
-unsigned char i2c_addr = 0x10;
-#define I2C_ADDR_PORT              2  // reserved input to define address
-#define I2C_ADDR_PORT_COUNT 	     4  // input port start at I2C_ADDR_PORT to I2C_ADDR_PORT+I2C_ADDR_PORT_COUNT
+unsigned char i2c_addr = 0;
+#define I2C_ADDR_PORT           0x10  // reserved digital input to define address
+#define I2C_ADDR_PORT_PIN          2  // reserved digital input count to define address
+#define I2C_ADDR_PORT_PIN_COUNT    4  // input port start at I2C_ADDR_PORT to I2C_ADDR_PORT+I2C_ADDR_PORT_COUNT
 
 // serial setup
-#define SERIAL_SPEED            9600  // remote by serial
+#define SERIAL_SPEED            9600  // remote by seriala
 
 // command setup
 #define INPUT_SWITCH_DELAY_MS   200   // minimum HIGH elapsed time before button is handled 
-#define POWER_LOAD_PIN            0   // input to measure power value
+#define POWER_LOAD_PICK_PIN       0   // analog input to measure power value
+#define POWER_LOAD_SWITCH_PIN     6   // switch power on or off
 
 // input command
-#define BTN_POWER_SWITCH          8   // switch to power on/off AC
+#define BTN_POWER_SWITCH          8   // digital pin switch to power on/off AC
 int power_button_high_start = 0;      // timing when the button was pushed
 
 // light feedback
@@ -29,15 +31,16 @@ int power_button_high_start = 0;      // timing when the button was pushed
 enum command_t
 {
   CMD_NONE                  = 0x00,
-  CMD_POWER_ON,                       // switch power on
+  CMD_POWER_ON              = 'p',    // switch power on
   CMD_POWER_OFF,                      // switch power off
+  CMD_UPDATE_I2C_ADDR,                // update I2C address
   CMD_I2C_ADDR,                       // request I2C address
   CMD_POWER_LOAD,                     // request power load
   CMD_POWER_STATE,                    // request power state (on or off)
   CMD_UNKNOWN                         // from this point command is unknown
 };
 // shall be present just after the command
-#define COMMAND_VALIDATE 0xDD
+#define COMMAND_VALIDATE '\n'
 
 // source on the command
 enum source_t
@@ -56,28 +59,19 @@ volatile bool command_validated = false;
 // POWER LOAD measure
 #define POWER_LOAD_PICK_TIME        100 // measure power load every POWER_LOAD_PICK_TIME ms
 #define POWER_LOAD_AVG_PICK_COUNT    10 // create an average value every POWER_LOAD_AVG_PICK_COUNT measure
-int  power_load_sum 	= 0;  // sum of power value measured since first
-int  power_load_count = 0;  // number of power value measured since first
-char power_load_avg   = 0;  // average power value
-int  power_load_last  = 0;  // last power value measured
+unsigned long power_load_sum 	  = 0;    // sum of power value measured since first
+unsigned short power_load_count = 0;    // number of power value measured since first
+unsigned short power_load_avg   = 0;    // average power value
+unsigned short power_load_last  = 0;    // last power value measured
  
 // waiting command
 volatile command_t pending_command = CMD_NONE;
 volatile source_t pending_source   = SRC_NONE;
 
 void setup()
-{  
-  // read i2c adress from digital dedicated PIN
-  for (unsigned char i = 0; i < I2C_ADDR_PORT_COUNT; ++i)
-  {
-    pinMode(I2C_ADDR_PORT + i, INPUT);
-    i2c_addr |= (digitalRead(I2C_ADDR_PORT + i) << i);
-  }
-  
-  // setup i2c
-  Wire.begin(i2c_addr);
-  Wire.onReceive(i2c_onReceive);
-  Wire.onRequest(i2c_onRequest);
+{
+  // set I2C address
+  reset_i2c();
   
   // setup serial port
   Serial.begin(SERIAL_SPEED, SERIAL_8N1);
@@ -86,6 +80,10 @@ void setup()
   pinMode(BTN_POWER_SWITCH, INPUT);
   pinMode(LED_POWER_ON, OUTPUT);
   pinMode(LED_POWER_OFF, OUTPUT);
+
+  Serial.println("Hello World !");
+  Serial.write(0x00);
+  Serial.write(0x10);Serial.write(0x00);
 }
 
 void loop()
@@ -101,13 +99,50 @@ void loop()
   update_power_load();
 }
 
+void reset_i2c()
+{
+  // reset TwoWire Control Register to default, inactive state
+  TWCR = 0;
+
+  // read i2c adress from digital dedicated PIN
+  i2c_addr = I2C_ADDR_PORT;
+  for (unsigned char i = 0; i < I2C_ADDR_PORT_PIN_COUNT; ++i)
+  {
+    pinMode(I2C_ADDR_PORT_PIN + i, INPUT);
+    i2c_addr |= (digitalRead(I2C_ADDR_PORT_PIN + i) << i);
+  }
+  
+  // setup i2c
+  Wire.begin(i2c_addr);
+  Wire.onReceive(i2c_onReceive);
+  Wire.onRequest(i2c_onRequest);
+}
+
 void ac_power(bool on)
 {
   // switch the relay to the request position
+  digitalWrite(POWER_LOAD_SWITCH_PIN, on ? HIGH : LOW);
   
   // light the corresponding led
-  digitalWrite(LED_POWER_ON,  on ? HIGH : LOW);
+  digitalWrite(LED_POWER_ON,   on ? HIGH : LOW);
   digitalWrite(LED_POWER_OFF, !on ? HIGH : LOW);
+}
+
+// return value in mA
+unsigned short instant_power_load()
+{
+  // return value between 0 and 1024
+  // matching [0-5] V range
+  unsigned long power_value = analogRead(POWER_LOAD_PICK_PIN);
+  // matching voltage measure is
+  // int voltage = power_value * 5 / 1024
+  // current measure is done by ACS712
+  // 1V -> 10A
+  // converting voltage to milli-ampere
+  short current = (power_value * 5 * 10 * 1000) >> 10;
+  
+  // ACS712 => 100mV/A
+  return current;
 }
 
 void update_power_load()
@@ -116,7 +151,7 @@ void update_power_load()
     return;
 
   // read current power load
-  char power_value = analogRead(POWER_LOAD_PIN);
+  unsigned short power_value = instant_power_load();
   
   // sum total load with current load
   power_load_sum += power_value;
@@ -125,7 +160,7 @@ void update_power_load()
   // compute load average if having done enought power pick
   if (power_load_count == POWER_LOAD_AVG_PICK_COUNT)
   {
-    power_load_avg = (char)(power_load_sum / power_load_count);
+    power_load_avg = (unsigned short)(power_load_sum / power_load_count);
     power_load_count = 0;
     power_load_sum = 0;
   }
@@ -136,6 +171,8 @@ void update_power_load()
 
 void handle_byte(char b, source_t src)
 {		
+  Serial.print("Received byte: ");
+  Serial.println(b);
   // backup received buffer
   last_received_source = src;
   
@@ -153,9 +190,11 @@ void handle_byte(char b, source_t src)
 }
 
 void input_read()
-{
-  // read from the intput button
-  if (digitalRead(BTN_POWER_SWITCH) == HIGH)
+{ 
+  // read from the input button
+  static bool command_sent = false;
+  char btn_state = digitalRead(BTN_POWER_SWITCH);
+  if (btn_state == HIGH)
   {
     // start timing the HIGH elasped time
     if (power_button_high_start == 0)
@@ -167,15 +206,23 @@ void input_read()
   {
     // reset HIGH elapsed time
     power_button_high_start = 0;
+    command_sent = false;
   }
   
-  // switch state after a button push of at least 200 ms
-  if (power_button_high_start != 0 &&
+  // switch state after a button push of at least INPUT_SWITCH_DELAY_MS ms
+  if (!command_sent && 
+      power_button_high_start != 0 &&
       millis() - power_button_high_start >= INPUT_SWITCH_DELAY_MS)
   {
-    char b = (power_load_last > 0) ? CMD_POWER_OFF : CMD_POWER_ON;
+    // get current power status
+    bool is_power_on = (instant_power_load() > 0);
+    // and inverse it
+    char b = is_power_on ? CMD_POWER_OFF : CMD_POWER_ON;
     handle_byte(b, SRC_INPUT);
     handle_byte(COMMAND_VALIDATE, SRC_INPUT);
+    
+    // do not repeatly sent this command
+    command_sent = true;
   }
 }
 
@@ -213,7 +260,9 @@ void i2c_onRequest()
       pending_command = CMD_NONE;
 		break;
     case CMD_POWER_LOAD:
-			Wire.write(power_load_avg);
+      // load is on 2 bytes, send byte 1, then byte 2
+			Wire.write((power_load_avg & 0xFF00) >> 8);
+      Wire.write(power_load_avg & 0x00FF);
 			Wire.write(COMMAND_VALIDATE);
 			pending_command = CMD_NONE;
 		break;
@@ -231,9 +280,12 @@ void handle_command()
   if (!command_validated)
 	return;
 
-//  backup command
-	char cmd = last_received_byte;
-	source_t src = last_received_source;
+  Serial.print("Handle command: ");
+  Serial.println(last_received_byte);
+  
+  // backup command
+	pending_command = (command_t)last_received_byte;
+	pending_source = last_received_source;
 
 	// reset received command
 	command_validated = false;
@@ -243,17 +295,25 @@ void handle_command()
   switch (pending_command)
   { 
   	case CMD_POWER_ON:  
+      Serial.println("Swith power on");
 			ac_power(true); 
 			pending_command = CMD_NONE;
 		break;
     case CMD_POWER_OFF: 
+      Serial.println("Swith power off");
 			ac_power(false); 
 			pending_command = CMD_NONE;
 		break;
+    case CMD_UPDATE_I2C_ADDR:
+      Serial.println("update I2C addr");
+      reset_i2c();
+    break;
     case CMD_I2C_ADDR:
+      Serial.println("req i2c");
       switch (pending_source)
       {
         case SRC_SERIAL:
+          Serial.println("Send I2C ADDR");
           Serial.write(i2c_addr);
           Serial.write(COMMAND_VALIDATE);
         case SRC_INPUT:
@@ -265,10 +325,13 @@ void handle_command()
       }
 		break;
     case CMD_POWER_LOAD:
+      Serial.println("req power load");
       switch (pending_source)
       {
         case SRC_SERIAL:
-          Serial.write(power_load_avg);
+          // load is on 2 bytes, send byte 1, then byte 2
+          Serial.write((power_load_avg & 0xFF00) >> 8);
+          Serial.write(power_load_avg & 0x00FF);
           Serial.write(COMMAND_VALIDATE);
         case SRC_INPUT:
           pending_command = CMD_NONE;
@@ -279,6 +342,7 @@ void handle_command()
       }
 		break;
     default:
+      Serial.println("undef command");
       // unsupported command
       pending_command = CMD_NONE;
 		break;
